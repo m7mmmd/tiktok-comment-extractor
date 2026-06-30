@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TikTok Comment Extractor</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="brand">
+        <span class="logo">TT</span>
+        <h1>Comment Extractor</h1>
+      </div>
+      <div id="videoLine" class="video-line">Loading…</div>
+    </header>
+
+    <section id="disabledBanner" class="banner hidden">
+      Comments are disabled on this video.
+    </section>
+
+    <section id="emptyState" class="empty-state hidden">
+      Open a TikTok video to begin.
+    </section>
+
+    <section id="main" class="main hidden">
+      <div class="stats">
+        <div class="stat">
+          <span id="statTotal" class="stat-num">0</span>
+          <span class="stat-label">Total</span>
+        </div>
+        <div class="stat">
+          <span id="statTop" class="stat-num">0</span>
+          <span class="stat-label">Top-level</span>
+        </div>
+        <div class="stat">
+          <span id="statReplies" class="stat-num">0</span>
+          <span class="stat-label">Replies</span>
+        </div>
+      </div>
+
+      <button id="captureBtn" class="btn btn-primary">
+        <span id="captureDot" class="dot hidden"></span>
+        <span id="captureLabel">Start Capture</span>
+      </button>
+
+      <div class="export-row">
+        <button id="csvBtn" class="btn btn-secondary" disabled>Export CSV</button>
+        <button id="xlsxBtn" class="btn btn-secondary" disabled>Export XLSX</button>
+      </div>
+
+      <a id="clearLink" class="clear-link" role="button" tabindex="0"
+        >Clear data for this video</a
+      >
+    </section>
+
+    <footer class="footer">
+      Data stays local to this browser and is cleared when the tab closes unless
+      exported.
+    </footer>
+
+    <script src="../lib/xlsx.full.min.js"></script>
+    <script src="../lib/exporter.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

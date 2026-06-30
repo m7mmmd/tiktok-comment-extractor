@@ -1,0 +1,20 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+
+# Logs
+*.log
+npm-debug.log*
+
+# Optional local scratch
+*.local
