@@ -17,6 +17,18 @@ let capturing = false;
 let scrollTimer = null;
 let lastPayloadAt = 0;
 
+// Capture options (overridable from the popup's saved settings on START_CAPTURE).
+const SPEED_PROFILES = {
+  slow: { dist: [300, 600], interval: [1200, 2200] },
+  normal: { dist: [400, 900], interval: [700, 1400] },
+  fast: { dist: [700, 1300], interval: [400, 800] },
+};
+let captureOpts = {
+  captureReplies: true,
+  scrollSpeed: "normal",
+  idleTimeoutMs: 6000,
+};
+
 // ---------------------------------------------------------------------------
 // 1. Request MAIN-world injection (content scripts cannot call chrome.scripting).
 // ---------------------------------------------------------------------------
@@ -71,6 +83,7 @@ setInterval(reportVideoId, 500);
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "START_CAPTURE") {
+    if (msg.options) applyCaptureOptions(msg.options);
     startAutoScroll();
     sendResponse({ ok: true, capturing: true });
   } else if (msg.type === "STOP_CAPTURE") {
@@ -85,6 +98,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // --- helpers ---------------------------------------------------------------
 
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+function applyCaptureOptions(opts) {
+  if (typeof opts.captureReplies === "boolean") {
+    captureOpts.captureReplies = opts.captureReplies;
+  }
+  if (opts.scrollSpeed && SPEED_PROFILES[opts.scrollSpeed]) {
+    captureOpts.scrollSpeed = opts.scrollSpeed;
+  }
+  if (typeof opts.idleTimeoutSec === "number" && opts.idleTimeoutSec > 0) {
+    captureOpts.idleTimeoutMs = opts.idleTimeoutSec * 1000;
+  }
+}
 
 // NOTE: these selectors are the single DOM dependency of the extension and may
 // need maintenance if TikTok restructures its markup. We try several strategies.
@@ -180,8 +205,8 @@ function startAutoScroll() {
   const tick = () => {
     if (!capturing) return;
 
-    // End-of-list detection: no new payloads within a 6s window.
-    if (Date.now() - lastPayloadAt > 6000) {
+    // End-of-list detection: no new payloads within the configured idle window.
+    if (Date.now() - lastPayloadAt > captureOpts.idleTimeoutMs) {
       stopAutoScroll();
       chrome.runtime
         .sendMessage({ type: "CAPTURE_COMPLETE", videoId: currentVideoId })
@@ -189,9 +214,11 @@ function startAutoScroll() {
       return;
     }
 
+    const profile = SPEED_PROFILES[captureOpts.scrollSpeed] || SPEED_PROFILES.normal;
+
     const target = getScrollTarget();
     if (target) {
-      const distance = rand(400, 900);
+      const distance = rand(profile.dist[0], profile.dist[1]);
       if (typeof target.scrollBy === "function") {
         target.scrollBy({ top: distance, behavior: "smooth" });
       } else {
@@ -199,15 +226,19 @@ function startAutoScroll() {
       }
     }
 
-    // Interleave reply expansion roughly every other tick.
-    if (Math.random() < 0.5) expandSomeReplies();
+    // Interleave reply expansion roughly every other tick (if enabled).
+    if (captureOpts.captureReplies && Math.random() < 0.5) expandSomeReplies();
 
     // Anti-detection: randomized cadence, with a 1-in-8 longer "reading" pause.
-    const interval = Math.random() < 0.125 ? rand(2000, 4000) : rand(700, 1400);
+    const interval =
+      Math.random() < 0.125
+        ? rand(profile.interval[1], profile.interval[1] * 2)
+        : rand(profile.interval[0], profile.interval[1]);
     scrollTimer = setTimeout(tick, interval);
   };
 
-  scrollTimer = setTimeout(tick, rand(700, 1400));
+  const profile = SPEED_PROFILES[captureOpts.scrollSpeed] || SPEED_PROFILES.normal;
+  scrollTimer = setTimeout(tick, rand(profile.interval[0], profile.interval[1]));
 }
 
 function stopAutoScroll() {
