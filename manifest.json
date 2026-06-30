@@ -1,16 +1,39 @@
 {
   "manifest_version": 3,
-  "name": "TikTok Comment Extractor",
-  "version": "1.0.0",
-  "description": "Passively captures TikTok comment API responses and exports the full thread (top-level + replies) to CSV and XLSX. Arabic/RTL safe.",
+  "name": "TikTok & Amazon Extractor",
+  "version": "1.1.0",
+  "description": "Captures TikTok comments (network) and Amazon product reviews (page), then exports to CSV and XLSX. Arabic/RTL safe.",
   "permissions": ["scripting", "storage", "activeTab", "downloads", "tabs"],
-  "host_permissions": ["*://*.tiktok.com/*"],
+  "host_permissions": [
+    "*://*.tiktok.com/*",
+    "*://*.amazon.com/*",
+    "*://*.amazon.co.uk/*",
+    "*://*.amazon.de/*",
+    "*://*.amazon.fr/*",
+    "*://*.amazon.es/*",
+    "*://*.amazon.it/*",
+    "*://*.amazon.nl/*",
+    "*://*.amazon.se/*",
+    "*://*.amazon.pl/*",
+    "*://*.amazon.ca/*",
+    "*://*.amazon.com.mx/*",
+    "*://*.amazon.com.br/*",
+    "*://*.amazon.com.au/*",
+    "*://*.amazon.co.jp/*",
+    "*://*.amazon.in/*",
+    "*://*.amazon.sg/*",
+    "*://*.amazon.ae/*",
+    "*://*.amazon.sa/*",
+    "*://*.amazon.eg/*",
+    "*://*.amazon.com.tr/*",
+    "*://*.amazon.com.be/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "TikTok Comment Extractor",
+    "default_title": "TikTok & Amazon Extractor",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -28,6 +51,33 @@
     {
       "matches": ["*://www.tiktok.com/*"],
       "js": ["content/content-script.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.amazon.com/*",
+        "*://*.amazon.co.uk/*",
+        "*://*.amazon.de/*",
+        "*://*.amazon.fr/*",
+        "*://*.amazon.es/*",
+        "*://*.amazon.it/*",
+        "*://*.amazon.nl/*",
+        "*://*.amazon.se/*",
+        "*://*.amazon.pl/*",
+        "*://*.amazon.ca/*",
+        "*://*.amazon.com.mx/*",
+        "*://*.amazon.com.br/*",
+        "*://*.amazon.com.au/*",
+        "*://*.amazon.co.jp/*",
+        "*://*.amazon.in/*",
+        "*://*.amazon.sg/*",
+        "*://*.amazon.ae/*",
+        "*://*.amazon.sa/*",
+        "*://*.amazon.eg/*",
+        "*://*.amazon.com.tr/*",
+        "*://*.amazon.com.be/*"
+      ],
+      "js": ["content/amazon-content.js"],
       "run_at": "document_idle"
     }
   ],

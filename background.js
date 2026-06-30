@@ -1,42 +1,56 @@
 // background.js — MV3 service worker.
 //
-// Central brain: receives raw comment payloads from the content script, maps
-// them to the canonical schema, dedupes by comment_id, mirrors per-video
-// datasets into chrome.storage.session (batched), maintains the toolbar badge,
-// and serves state/rows/exports to the popup.
-
-const CANONICAL_COLUMNS = [
-  "comment_id",
-  "parent_comment_id",
-  "is_reply",
-  "username",
-  "display_name",
-  "comment_text",
-  "like_count",
-  "reply_count",
-  "created_at",
-  "video_id",
-  "captured_at",
-];
+// Central brain for two sources:
+//   • TikTok  — receives raw comment API payloads (from the MAIN-world patch via
+//               the content script), normalizes + dedups them here.
+//   • Amazon  — receives already-normalized review rows (DOM-parsed in the
+//               content script, since Amazon renders reviews as HTML).
+//
+// Datasets are keyed by item id (TikTok videoId or Amazon ASIN — these never
+// collide), mirrored into chrome.storage.session in batched writes, surfaced on
+// the toolbar badge, and served to the popup for state/rows/exports.
 
 const BADGE_IDLE = "#5A5A5A";
 const BADGE_ACTIVE = "#1DB954";
-const VIDEO_RE = /\/@[^/]+\/video\/(\d+)/;
+
+const TT_VIDEO_RE = /\/@[^/]+\/video\/(\d+)/;
+const AMZN_ASIN_RE =
+  /\/(?:dp|gp\/product|gp\/aw\/d|product-reviews)\/([A-Z0-9]{10})(?:[/?]|$)/i;
 
 // In-memory state (rebuilt from storage.session on worker wake).
-const datasets = new Map(); // videoId -> Map<commentId, row>
-const capturingVideos = new Set(); // videoId currently auto-scrolling
-const commentsDisabled = new Set(); // videoId flagged comments-disabled
-const tabVideo = new Map(); // tabId -> videoId
+const datasets = new Map(); // id -> Map<itemId, row>
+const sourceById = new Map(); // id -> "tiktok" | "amazon"
+const capturingIds = new Set(); // ids with an active capture session
+const commentsDisabled = new Set(); // TikTok ids flagged comments-disabled
+const tabContext = new Map(); // tabId -> { source, id }
 
 // ---------------------------------------------------------------------------
-// STEP 0 RECON HOOK — normalize().
-//
-// Maps TikTok's raw comment object to the canonical schema. The field names
-// below reflect the last-known TikTok comment API shape and MUST be verified in
-// DevTools at build time (TikTok rotates these). Everything uses optional
-// chaining + nullish fallbacks so a renamed/missing field skips the row with a
-// console warning instead of throwing.
+// Context detection from a URL.
+// ---------------------------------------------------------------------------
+function detectContext(url) {
+  if (!url) return null;
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  const host = u.hostname;
+  if (host.endsWith("tiktok.com")) {
+    const m = u.pathname.match(TT_VIDEO_RE);
+    if (m) return { source: "tiktok", id: m[1] };
+  }
+  if (/(^|\.)amazon\./.test(host)) {
+    const m = u.pathname.match(AMZN_ASIN_RE);
+    if (m) return { source: "amazon", id: m[1].toUpperCase() };
+  }
+  return null;
+}
+
+const rowId = (row) => row.comment_id ?? row.review_id ?? null;
+
+// ===========================================================================
+// TikTok normalization (STEP 0 RECON HOOK — verify field names in DevTools).
 //
 //   raw.cid                       -> comment_id
 //   raw.text                      -> comment_text  (raw UTF-8, untouched)
@@ -46,29 +60,24 @@ const tabVideo = new Map(); // tabId -> videoId
 //   raw.reply_comment_total       -> reply_count
 //   raw.create_time (unix secs)   -> created_at (ISO 8601 UTC)
 //   raw.aweme_id                  -> video_id
-// ---------------------------------------------------------------------------
-function normalize(raw, parentId, videoId) {
+// ===========================================================================
+function normalizeTikTok(raw, parentId, videoId) {
   try {
-    const commentId =
-      raw?.cid ?? raw?.comment_id ?? raw?.id ?? null;
+    const commentId = raw?.cid ?? raw?.comment_id ?? raw?.id ?? null;
     if (!commentId) {
       console.warn("[TTE] normalize: missing comment id, skipping", raw);
       return null;
     }
-
     const user = raw?.user ?? raw?.author ?? {};
     const createSecs = raw?.create_time ?? raw?.created_time ?? null;
     const createdAt =
       typeof createSecs === "number" && createSecs > 0
         ? new Date(createSecs * 1000).toISOString()
         : "";
-
-    const isReply = !!parentId;
-
     return {
       comment_id: String(commentId),
       parent_comment_id: parentId ? String(parentId) : "",
-      is_reply: isReply,
+      is_reply: !!parentId,
       username: user?.unique_id ?? user?.uniqueId ?? user?.sec_uid ?? "",
       display_name: user?.nickname ?? user?.nick_name ?? "",
       comment_text: raw?.text ?? raw?.comment_text ?? "",
@@ -84,8 +93,6 @@ function normalize(raw, parentId, videoId) {
   }
 }
 
-// Derive the root comment id for a reply-list payload from the request URL
-// (?comment_id=...) with a fallback to a field on the payload.
 function deriveParentId(url, payload) {
   try {
     const u = new URL(url);
@@ -96,45 +103,38 @@ function deriveParentId(url, payload) {
   return payload?.comment_id ?? payload?.reply_id ?? null;
 }
 
-function getDataset(videoId) {
-  let map = datasets.get(videoId);
+// ---------------------------------------------------------------------------
+// Dataset helpers.
+// ---------------------------------------------------------------------------
+function getDataset(id) {
+  let map = datasets.get(id);
   if (!map) {
     map = new Map();
-    datasets.set(videoId, map);
+    datasets.set(id, map);
   }
   return map;
 }
 
-function countsFor(videoId) {
-  const map = datasets.get(videoId);
-  let topLevel = 0;
-  let replies = 0;
-  if (map) {
-    for (const row of map.values()) {
-      if (row.is_reply) replies++;
-      else topLevel++;
-    }
-  }
-  return { total: topLevel + replies, topLevel, replies };
+function countsFor(id) {
+  const map = datasets.get(id);
+  return map ? map.size : 0;
 }
 
 // ---------------------------------------------------------------------------
-// Payload ingestion.
+// TikTok payload ingestion.
 // ---------------------------------------------------------------------------
-function ingest({ kind, url, payload, videoId }) {
+function ingestTikTok({ kind, url, payload, videoId }) {
   const vid = String(videoId ?? payload?.comments?.[0]?.aweme_id ?? "");
   if (!vid) return;
+  sourceById.set(vid, "tiktok");
 
-  // Comments-disabled detection (defensive — flag may move/rename).
   const list = Array.isArray(payload?.comments) ? payload.comments : null;
   if (kind === "list") {
     const disabledFlag =
       payload?.comment_config?.disabled ??
       payload?.comments_disabled ??
       (list === null && (payload?.status_code === 0 || payload?.total === 0));
-    if (disabledFlag === true) {
-      commentsDisabled.add(vid);
-    }
+    if (disabledFlag === true) commentsDisabled.add(vid);
   }
 
   if (!list || list.length === 0) {
@@ -147,65 +147,88 @@ function ingest({ kind, url, payload, videoId }) {
   const map = getDataset(vid);
 
   for (const raw of list) {
-    const row = normalize(raw, parentId, vid);
+    const row = normalizeTikTok(raw, parentId, vid);
     if (!row) continue;
-    map.set(row.comment_id, row); // dedup by comment_id
+    map.set(row.comment_id, row);
 
-    // A reply-list response may also embed the reply's own sub-replies; if any
-    // nested array exists, flatten it too (reply-to-reply via parent chain).
     const nested = Array.isArray(raw?.reply_comment) ? raw.reply_comment : null;
     if (nested) {
       for (const r2 of nested) {
-        const childRow = normalize(r2, row.comment_id, vid);
+        const childRow = normalizeTikTok(r2, row.comment_id, vid);
         if (childRow) map.set(childRow.comment_id, childRow);
       }
     }
   }
 
   scheduleSave(vid);
-  updateBadgeForVideo(vid);
+  updateBadgeForId(vid);
   pushStateUpdate(vid);
 }
 
 // ---------------------------------------------------------------------------
-// Batched persistence to chrome.storage.session (debounced ~500ms per video).
+// Amazon row ingestion (rows arrive already normalized from the content script).
 // ---------------------------------------------------------------------------
-const saveTimers = new Map();
-function scheduleSave(videoId) {
-  if (saveTimers.has(videoId)) return;
-  const t = setTimeout(() => {
-    saveTimers.delete(videoId);
-    persist(videoId);
-  }, 500);
-  saveTimers.set(videoId, t);
+function ingestAmazon(asin, rows) {
+  if (!asin || !Array.isArray(rows)) return;
+  sourceById.set(asin, "amazon");
+  const map = getDataset(asin);
+  for (const row of rows) {
+    if (!row) continue;
+    const key =
+      row.review_id || `${row.author || ""}|${(row.review_text || "").slice(0, 80)}`;
+    if (!key) continue;
+    map.set(key, row);
+  }
+  scheduleSave(asin);
+  updateBadgeForId(asin);
+  pushStateUpdate(asin);
 }
 
-async function persist(videoId) {
-  const map = datasets.get(videoId);
+// ---------------------------------------------------------------------------
+// Batched persistence to chrome.storage.session (debounced ~500ms per id).
+// ---------------------------------------------------------------------------
+const saveTimers = new Map();
+function scheduleSave(id) {
+  if (saveTimers.has(id)) return;
+  const t = setTimeout(() => {
+    saveTimers.delete(id);
+    persist(id);
+  }, 500);
+  saveTimers.set(id, t);
+}
+
+async function persist(id) {
+  const map = datasets.get(id);
   const rows = map ? Array.from(map.values()) : [];
   try {
     await chrome.storage.session.set({
-      [`dataset:${videoId}`]: rows,
-      [`disabled:${videoId}`]: commentsDisabled.has(videoId),
+      [`dataset:${id}`]: rows,
+      [`source:${id}`]: sourceById.get(id) || null,
+      [`disabled:${id}`]: commentsDisabled.has(id),
     });
   } catch (err) {
     console.warn("[TTE] persist failed:", err);
   }
 }
 
-async function restoreVideo(videoId) {
-  if (datasets.has(videoId)) return;
+async function restore(id) {
+  if (datasets.has(id)) return;
   try {
-    const key = `dataset:${videoId}`;
-    const dkey = `disabled:${videoId}`;
-    const stored = await chrome.storage.session.get([key, dkey]);
-    const rows = stored[key];
+    const keys = [`dataset:${id}`, `source:${id}`, `disabled:${id}`];
+    const stored = await chrome.storage.session.get(keys);
+    const rows = stored[`dataset:${id}`];
     if (Array.isArray(rows)) {
       const map = new Map();
-      for (const row of rows) map.set(row.comment_id, row);
-      datasets.set(videoId, map);
+      for (const row of rows) {
+        const key =
+          rowId(row) ||
+          `${row.author || ""}|${(row.review_text || "").slice(0, 80)}`;
+        map.set(key, row);
+      }
+      datasets.set(id, map);
     }
-    if (stored[dkey]) commentsDisabled.add(videoId);
+    if (stored[`source:${id}`]) sourceById.set(id, stored[`source:${id}`]);
+    if (stored[`disabled:${id}`]) commentsDisabled.add(id);
   } catch (err) {
     console.warn("[TTE] restore failed:", err);
   }
@@ -220,21 +243,21 @@ function abbreviate(n) {
   return (k >= 100 ? Math.round(k) : k.toFixed(1).replace(/\.0$/, "")) + "k";
 }
 
-function tabsForVideo(videoId) {
+function tabsForId(id) {
   const ids = [];
-  for (const [tabId, vid] of tabVideo.entries()) {
-    if (vid === videoId) ids.push(tabId);
+  for (const [tabId, ctx] of tabContext.entries()) {
+    if (ctx && ctx.id === id) ids.push(tabId);
   }
   return ids;
 }
 
-function setBadge(tabId, videoId) {
-  if (!videoId) {
+function setBadge(tabId, id) {
+  if (!id) {
     chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
     return;
   }
-  const { total } = countsFor(videoId);
-  const active = capturingVideos.has(videoId);
+  const total = countsFor(id);
+  const active = capturingIds.has(id);
   chrome.action
     .setBadgeBackgroundColor({ tabId, color: active ? BADGE_ACTIVE : BADGE_IDLE })
     .catch(() => {});
@@ -243,31 +266,59 @@ function setBadge(tabId, videoId) {
     .catch(() => {});
 }
 
-function updateBadgeForVideo(videoId) {
-  for (const tabId of tabsForVideo(videoId)) setBadge(tabId, videoId);
+function updateBadgeForId(id) {
+  for (const tabId of tabsForId(id)) setBadge(tabId, id);
 }
 
 // ---------------------------------------------------------------------------
-// Push state to an open popup (best-effort; popup may be closed).
+// State for the popup.
 // ---------------------------------------------------------------------------
-function buildState(videoId) {
-  const counts = countsFor(videoId);
-  return {
-    videoId: videoId || null,
-    ...counts,
-    capturing: videoId ? capturingVideos.has(videoId) : false,
-    commentsDisabled: videoId ? commentsDisabled.has(videoId) : false,
+function buildState(id) {
+  const source = id ? sourceById.get(id) || null : null;
+  const map = id ? datasets.get(id) : null;
+  const rows = map ? Array.from(map.values()) : [];
+
+  const base = {
+    source,
+    id: id || null,
+    videoId: id || null, // backward-compat alias
+    total: rows.length,
+    capturing: id ? capturingIds.has(id) : false,
   };
+
+  if (source === "tiktok") {
+    let topLevel = 0;
+    let replies = 0;
+    for (const row of rows) row.is_reply ? replies++ : topLevel++;
+    base.topLevel = topLevel;
+    base.replies = replies;
+    base.commentsDisabled = id ? commentsDisabled.has(id) : false;
+  } else if (source === "amazon") {
+    let verified = 0;
+    let sum = 0;
+    let rated = 0;
+    for (const row of rows) {
+      if (row.verified_purchase) verified++;
+      const r = Number(row.rating);
+      if (r > 0) {
+        sum += r;
+        rated++;
+      }
+    }
+    base.verified = verified;
+    base.avgRating = rated ? Math.round((sum / rated) * 10) / 10 : 0;
+  }
+  return base;
 }
 
-function pushStateUpdate(videoId) {
+function pushStateUpdate(id) {
   chrome.runtime
-    .sendMessage({ type: "STATE_UPDATE", state: buildState(videoId) })
+    .sendMessage({ type: "STATE_UPDATE", state: buildState(id) })
     .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
-// MAIN-world injection on content-script request.
+// MAIN-world injection on TikTok content-script request.
 // ---------------------------------------------------------------------------
 function injectMainWorld(tabId) {
   chrome.scripting
@@ -279,11 +330,24 @@ function injectMainWorld(tabId) {
     .catch((err) => console.warn("[TTE] MAIN-world injection failed:", err));
 }
 
+function setTabContext(tabId, source, id) {
+  if (tabId == null) return;
+  if (id) {
+    tabContext.set(tabId, { source, id });
+    sourceById.set(id, source);
+    restore(id).then(() => setBadge(tabId, id));
+  } else {
+    tabContext.delete(tabId);
+    setBadge(tabId, null);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Message routing.
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender?.tab?.id;
+  const id = msg?.id ?? msg?.videoId ?? null;
 
   switch (msg?.type) {
     case "INJECT_MAIN_WORLD":
@@ -291,40 +355,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       return false;
 
-    case "VIDEO_CONTEXT": {
-      const vid = msg.videoId || null;
-      if (tabId != null) {
-        if (vid) tabVideo.set(tabId, vid);
-        else tabVideo.delete(tabId);
-        if (vid) restoreVideo(vid).then(() => setBadge(tabId, vid));
-        else setBadge(tabId, null);
-      }
+    case "VIDEO_CONTEXT":
+      setTabContext(tabId, "tiktok", msg.videoId || null);
       sendResponse({ ok: true });
       return false;
-    }
+
+    case "AMAZON_CONTEXT":
+      setTabContext(tabId, "amazon", msg.asin || null);
+      sendResponse({ ok: true });
+      return false;
 
     case "RAW_COMMENT_PAYLOAD":
-      ingest(msg);
+      ingestTikTok(msg);
       sendResponse({ ok: true });
       return false;
 
-    case "CAPTURE_STATE": {
-      const vid = msg.videoId;
-      if (vid) {
-        if (msg.capturing) capturingVideos.add(vid);
-        else capturingVideos.delete(vid);
-        updateBadgeForVideo(vid);
-        pushStateUpdate(vid);
+    case "AMAZON_REVIEWS":
+      ingestAmazon(msg.asin, msg.rows);
+      sendResponse({ ok: true });
+      return false;
+
+    case "CAPTURE_STATE":
+      if (id) {
+        if (msg.capturing) capturingIds.add(id);
+        else capturingIds.delete(id);
+        updateBadgeForId(id);
+        pushStateUpdate(id);
       }
       sendResponse({ ok: true });
       return false;
-    }
 
     case "CAPTURE_COMPLETE":
-      if (msg.videoId) {
-        capturingVideos.delete(msg.videoId);
-        updateBadgeForVideo(msg.videoId);
-        pushStateUpdate(msg.videoId);
+      if (id) {
+        capturingIds.delete(id);
+        updateBadgeForId(id);
+        pushStateUpdate(id);
       }
       sendResponse({ ok: true });
       return false;
@@ -334,11 +399,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true; // async
 
     case "GET_ROWS":
-      handleGetRows(msg.videoId, sendResponse);
+      handleGetRows(id, sendResponse);
       return true; // async
 
     case "CLEAR_REQUEST":
-      handleClear(msg.videoId, sendResponse);
+      handleClear(id, sendResponse);
       return true; // async
 
     default:
@@ -353,54 +418,47 @@ async function activeTab() {
 
 async function handleGetState(sendResponse) {
   const tab = await activeTab();
-  let videoId = null;
-  if (tab?.url) {
-    const m = tab.url.match(VIDEO_RE);
-    videoId = m ? m[1] : null;
+  const ctx = detectContext(tab?.url);
+  if (ctx) {
+    sourceById.set(ctx.id, ctx.source);
+    await restore(ctx.id);
   }
-  if (videoId) await restoreVideo(videoId);
-  sendResponse({ ...buildState(videoId), tabId: tab?.id ?? null });
+  sendResponse({ ...buildState(ctx?.id || null), tabId: tab?.id ?? null });
 }
 
-async function handleGetRows(videoId, sendResponse) {
-  if (!videoId) {
+async function handleGetRows(id, sendResponse) {
+  if (!id) {
     sendResponse({ rows: [] });
     return;
   }
-  await restoreVideo(videoId);
-  const map = datasets.get(videoId);
+  await restore(id);
+  const map = datasets.get(id);
   sendResponse({ rows: map ? Array.from(map.values()) : [] });
 }
 
-async function handleClear(videoId, sendResponse) {
-  if (videoId) {
-    datasets.delete(videoId);
-    commentsDisabled.delete(videoId);
+async function handleClear(id, sendResponse) {
+  if (id) {
+    datasets.delete(id);
+    commentsDisabled.delete(id);
     try {
       await chrome.storage.session.remove([
-        `dataset:${videoId}`,
-        `disabled:${videoId}`,
+        `dataset:${id}`,
+        `source:${id}`,
+        `disabled:${id}`,
       ]);
     } catch {}
-    updateBadgeForVideo(videoId);
-    pushStateUpdate(videoId);
+    updateBadgeForId(id);
+    pushStateUpdate(id);
   }
   sendResponse({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
-// Tab lifecycle → clear badge when leaving a TikTok video page.
+// Tab lifecycle → keep badge in sync; clear when leaving a supported page.
 // ---------------------------------------------------------------------------
 function syncTabBadge(tabId, url) {
-  const m = url ? url.match(VIDEO_RE) : null;
-  const vid = m ? m[1] : null;
-  if (vid) {
-    tabVideo.set(tabId, vid);
-    restoreVideo(vid).then(() => setBadge(tabId, vid));
-  } else {
-    tabVideo.delete(tabId);
-    setBadge(tabId, null);
-  }
+  const ctx = detectContext(url);
+  setTabContext(tabId, ctx?.source || null, ctx?.id || null);
 }
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -417,5 +475,5 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabVideo.delete(tabId);
+  tabContext.delete(tabId);
 });

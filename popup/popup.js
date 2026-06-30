@@ -1,7 +1,9 @@
-// popup.js — toolbar UI. Talks to the background worker for state/rows and to
-// the content script for capture control. Exports are built here (popup context
-// has URL.createObjectURL and the SheetJS global available).
+// popup.js — toolbar UI for both sources (TikTok comments / Amazon reviews).
+// Talks to the background worker for state/rows and to the active tab's content
+// script for capture control. Exports are built here (popup context has
+// URL.createObjectURL and the SheetJS global available).
 
+const TTE = window.TTEExporter;
 const el = (id) => document.getElementById(id);
 
 const ui = {
@@ -9,12 +11,16 @@ const ui = {
   disabledBanner: el("disabledBanner"),
   emptyState: el("emptyState"),
   main: el("main"),
-  statTotal: el("statTotal"),
-  statTop: el("statTop"),
-  statReplies: el("statReplies"),
+  statN1: el("statN1"),
+  statN2: el("statN2"),
+  statN3: el("statN3"),
+  statL1: el("statL1"),
+  statL2: el("statL2"),
+  statL3: el("statL3"),
   captureBtn: el("captureBtn"),
   captureLabel: el("captureLabel"),
   captureDot: el("captureDot"),
+  captureHint: el("captureHint"),
   csvBtn: el("csvBtn"),
   xlsxBtn: el("xlsxBtn"),
   clearLink: el("clearLink"),
@@ -22,22 +28,29 @@ const ui = {
   settingsBtn: el("settingsBtn"),
   settingsOverlay: el("settingsOverlay"),
   settingsClose: el("settingsClose"),
+  colSrcTiktok: el("colSrcTiktok"),
+  colSrcAmazon: el("colSrcAmazon"),
   columnList: el("columnList"),
   colsAll: el("colsAll"),
   colsNone: el("colsNone"),
   setCaptureReplies: el("setCaptureReplies"),
   setScrollSpeed: el("setScrollSpeed"),
   setIdleTimeout: el("setIdleTimeout"),
+  setAutoPaginate: el("setAutoPaginate"),
+  setMaxPages: el("setMaxPages"),
   setDefaultFormat: el("setDefaultFormat"),
   resetSettings: el("resetSettings"),
   savedHint: el("savedHint"),
 };
 
 let state = {
-  videoId: null,
+  source: null,
+  id: null,
   total: 0,
   topLevel: 0,
   replies: 0,
+  verified: 0,
+  avgRating: 0,
   capturing: false,
   commentsDisabled: false,
   tabId: null,
@@ -47,38 +60,77 @@ let clearTimer = null;
 
 // --- settings --------------------------------------------------------------
 const SETTINGS_KEY = "tte:settings";
-const ALL_COLUMNS = window.TTEExporter.COLUMNS;
-const REQUIRED_COLUMNS = window.TTEExporter.REQUIRED_COLUMNS;
+
+function defaultColumns(source) {
+  const o = {};
+  for (const c of TTE.columnsFor(source)) o[c] = true;
+  return o;
+}
 
 const DEFAULT_SETTINGS = {
-  columns: ALL_COLUMNS.reduce((acc, c) => ((acc[c] = true), acc), {}),
-  captureReplies: true,
-  scrollSpeed: "normal",
-  idleTimeoutSec: 6,
+  columns: {
+    tiktok: defaultColumns("tiktok"),
+    amazon: defaultColumns("amazon"),
+  },
+  tiktok: { captureReplies: true, scrollSpeed: "normal", idleTimeoutSec: 6 },
+  amazon: { autoPaginate: true, maxPages: 0 },
   defaultFormat: "xlsx",
 };
 
 let settings = structuredClone(DEFAULT_SETTINGS);
+let colSource = "tiktok"; // which column set the settings panel is editing
 let savedHintTimer = null;
+
+// Migrate older flat settings ({ columns:{...tiktokCols}, captureReplies, ... }).
+function migrateSettings(saved) {
+  if (!saved || typeof saved !== "object") return null;
+  const looksOld =
+    saved.columns &&
+    (saved.columns.comment_id !== undefined || !saved.columns.tiktok);
+  if (!looksOld) return saved;
+  return {
+    columns: {
+      tiktok: { ...defaultColumns("tiktok"), ...(saved.columns || {}) },
+      amazon: defaultColumns("amazon"),
+    },
+    tiktok: {
+      captureReplies: saved.captureReplies ?? true,
+      scrollSpeed: saved.scrollSpeed ?? "normal",
+      idleTimeoutSec: saved.idleTimeoutSec ?? 6,
+    },
+    amazon: { autoPaginate: true, maxPages: 0 },
+    defaultFormat: saved.defaultFormat ?? "xlsx",
+  };
+}
 
 async function loadSettings() {
   try {
     const stored = await chrome.storage.local.get(SETTINGS_KEY);
-    const saved = stored[SETTINGS_KEY];
+    const saved = migrateSettings(stored[SETTINGS_KEY]);
     if (saved) {
       settings = {
         ...structuredClone(DEFAULT_SETTINGS),
         ...saved,
-        columns: { ...DEFAULT_SETTINGS.columns, ...(saved.columns || {}) },
+        columns: {
+          tiktok: { ...defaultColumns("tiktok"), ...(saved.columns?.tiktok || {}) },
+          amazon: { ...defaultColumns("amazon"), ...(saved.columns?.amazon || {}) },
+        },
+        tiktok: { ...DEFAULT_SETTINGS.tiktok, ...(saved.tiktok || {}) },
+        amazon: { ...DEFAULT_SETTINGS.amazon, ...(saved.amazon || {}) },
       };
     }
   } catch {}
-  // Required columns can never be disabled.
-  for (const req of REQUIRED_COLUMNS) settings.columns[req] = true;
+  enforceRequired();
+}
+
+function enforceRequired() {
+  for (const src of ["tiktok", "amazon"]) {
+    for (const req of TTE.requiredFor(src)) settings.columns[src][req] = true;
+  }
 }
 
 async function saveSettings() {
-  for (const req of REQUIRED_COLUMNS) settings.columns[req] = true;
+  enforceRequired();
   try {
     await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
     flashSaved();
@@ -91,27 +143,39 @@ function flashSaved() {
   savedHintTimer = setTimeout(() => ui.savedHint.classList.remove("show"), 1200);
 }
 
-function selectedColumns() {
-  return ALL_COLUMNS.filter((c) => settings.columns[c]);
+function selectedColumns(source) {
+  return TTE.columnsFor(source).filter((c) => settings.columns[source][c]);
 }
 
+// --- main UI ---------------------------------------------------------------
 function render() {
-  const onVideo = !!state.videoId;
+  const onSupported = !!state.source;
 
-  ui.emptyState.classList.toggle("hidden", onVideo);
-  ui.main.classList.toggle("hidden", !onVideo);
+  ui.emptyState.classList.toggle("hidden", onSupported);
+  ui.main.classList.toggle("hidden", !onSupported);
   ui.disabledBanner.classList.toggle(
     "hidden",
-    !(onVideo && state.commentsDisabled)
+    !(state.source === "tiktok" && state.commentsDisabled)
   );
 
-  ui.videoLine.textContent = onVideo
-    ? `Video ${truncate(state.videoId)}`
-    : "Not on a TikTok video";
-
-  ui.statTotal.textContent = state.total;
-  ui.statTop.textContent = state.topLevel;
-  ui.statReplies.textContent = state.replies;
+  if (state.source === "amazon") {
+    ui.videoLine.textContent = `Product ${state.id || ""}`;
+    setStat(ui.statN1, ui.statL1, state.total, "Reviews");
+    setStat(ui.statN2, ui.statL2, state.avgRating ? state.avgRating : "—", "Avg \u2605");
+    setStat(ui.statN3, ui.statL3, state.verified, "Verified");
+    ui.captureHint.textContent =
+      "Auto-paginates through Amazon's review pages. Start on a product or 'all reviews' page.";
+    ui.captureHint.classList.remove("hidden");
+  } else if (state.source === "tiktok") {
+    ui.videoLine.textContent = `Video ${truncate(state.id)}`;
+    setStat(ui.statN1, ui.statL1, state.total, "Total");
+    setStat(ui.statN2, ui.statL2, state.topLevel, "Top-level");
+    setStat(ui.statN3, ui.statL3, state.replies, "Replies");
+    ui.captureHint.classList.add("hidden");
+  } else {
+    ui.videoLine.textContent = "Not on a supported page";
+    ui.captureHint.classList.add("hidden");
+  }
 
   ui.captureLabel.textContent = state.capturing ? "Stop Capture" : "Start Capture";
   ui.captureBtn.classList.toggle("capturing", state.capturing);
@@ -122,9 +186,14 @@ function render() {
   ui.xlsxBtn.disabled = noData;
 }
 
+function setStat(numEl, labelEl, value, label) {
+  numEl.textContent = value;
+  labelEl.textContent = label;
+}
+
 function truncate(id) {
   if (!id) return "";
-  return id.length > 12 ? id.slice(0, 6) + "…" + id.slice(-4) : id;
+  return id.length > 12 ? id.slice(0, 6) + "\u2026" + id.slice(-4) : id;
 }
 
 function applyState(next) {
@@ -142,34 +211,38 @@ async function loadState() {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === "STATE_UPDATE" && msg.state) {
-    // Only adopt updates for the video we're currently showing.
-    if (!state.videoId || msg.state.videoId === state.videoId) {
+    if (!state.id || msg.state.id === state.id) {
       applyState({ ...msg.state, tabId: state.tabId });
     }
   }
 });
 
-// Light polling as a fallback in case a push is missed.
 setInterval(loadState, 1500);
 
 // --- capture toggle --------------------------------------------------------
 ui.captureBtn.addEventListener("click", async () => {
-  if (!state.tabId) return;
+  if (!state.tabId || !state.source) return;
   const starting = !state.capturing;
   const type = starting ? "START_CAPTURE" : "STOP_CAPTURE";
-  // Optimistic flip for snappy UI.
   applyState({ capturing: starting });
-  const options = starting
-    ? {
-        captureReplies: settings.captureReplies,
-        scrollSpeed: settings.scrollSpeed,
-        idleTimeoutSec: settings.idleTimeoutSec,
-      }
-    : undefined;
+
+  let options;
+  if (starting) {
+    options =
+      state.source === "amazon"
+        ? {
+            autoPaginate: settings.amazon.autoPaginate,
+            maxPages: settings.amazon.maxPages,
+          }
+        : {
+            captureReplies: settings.tiktok.captureReplies,
+            scrollSpeed: settings.tiktok.scrollSpeed,
+            idleTimeoutSec: settings.tiktok.idleTimeoutSec,
+          };
+  }
   try {
     await chrome.tabs.sendMessage(state.tabId, { type, options });
   } catch {
-    // Content script may not be ready; revert and reload truth.
     loadState();
   }
 });
@@ -178,7 +251,7 @@ ui.captureBtn.addEventListener("click", async () => {
 async function fetchRows() {
   const res = await chrome.runtime.sendMessage({
     type: "GET_ROWS",
-    videoId: state.videoId,
+    id: state.id,
   });
   return res?.rows ?? [];
 }
@@ -200,20 +273,18 @@ async function doExport(format) {
   const rows = await fetchRows();
   if (!rows.length) return;
 
-  const options = { columns: selectedColumns() };
-  let blob;
-  if (format === "csv") {
-    blob = window.TTEExporter.buildCsvBlob(rows, options);
-  } else {
-    blob = window.TTEExporter.buildXlsxBlob(rows, options);
-  }
+  const options = { columns: selectedColumns(state.source) };
+  const blob =
+    format === "csv"
+      ? TTE.buildCsvBlob(rows, options)
+      : TTE.buildXlsxBlob(rows, options);
 
   const url = URL.createObjectURL(blob);
-  const filename = `tiktok-comments-${state.videoId}-${timestamp()}.${format}`;
+  const prefix = state.source === "amazon" ? "amazon-reviews" : "tiktok-comments";
+  const filename = `${prefix}-${state.id}-${timestamp()}.${format}`;
   try {
     await chrome.downloads.download({ url, filename, saveAs: false });
   } finally {
-    // Revoke shortly after the download has had a chance to start.
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 }
@@ -225,7 +296,7 @@ ui.xlsxBtn.addEventListener("click", () => doExport("xlsx"));
 function resetClearLink() {
   clearArmed = false;
   ui.clearLink.classList.remove("confirm");
-  ui.clearLink.textContent = "Clear data for this video";
+  ui.clearLink.textContent = "Clear data for this item";
   if (clearTimer) {
     clearTimeout(clearTimer);
     clearTimer = null;
@@ -233,7 +304,7 @@ function resetClearLink() {
 }
 
 async function handleClear() {
-  if (!state.videoId) return;
+  if (!state.id) return;
   if (!clearArmed) {
     clearArmed = true;
     ui.clearLink.classList.add("confirm");
@@ -242,11 +313,8 @@ async function handleClear() {
     return;
   }
   resetClearLink();
-  await chrome.runtime.sendMessage({
-    type: "CLEAR_REQUEST",
-    videoId: state.videoId,
-  });
-  applyState({ total: 0, topLevel: 0, replies: 0 });
+  await chrome.runtime.sendMessage({ type: "CLEAR_REQUEST", id: state.id });
+  applyState({ total: 0, topLevel: 0, replies: 0, verified: 0, avgRating: 0 });
   loadState();
 }
 
@@ -258,18 +326,20 @@ ui.clearLink.addEventListener("keydown", (e) => {
 // --- settings UI -----------------------------------------------------------
 function renderColumnList() {
   ui.columnList.innerHTML = "";
-  for (const col of ALL_COLUMNS) {
-    const locked = REQUIRED_COLUMNS.includes(col);
+  const cols = TTE.columnsFor(colSource);
+  const required = TTE.requiredFor(colSource);
+  const bag = settings.columns[colSource];
+  for (const col of cols) {
+    const locked = required.includes(col);
     const label = document.createElement("label");
     label.className = "check-item" + (locked ? " locked" : "");
 
     const input = document.createElement("input");
     input.type = "checkbox";
-    input.checked = !!settings.columns[col];
+    input.checked = !!bag[col];
     input.disabled = locked;
-    input.dataset.col = col;
     input.addEventListener("change", () => {
-      settings.columns[col] = input.checked;
+      bag[col] = input.checked;
       saveSettings();
     });
 
@@ -282,16 +352,24 @@ function renderColumnList() {
   }
 }
 
-function applySettingsToControls() {
-  ui.setCaptureReplies.checked = !!settings.captureReplies;
-  ui.setScrollSpeed.value = settings.scrollSpeed;
-  ui.setIdleTimeout.value = String(settings.idleTimeoutSec);
-  ui.setDefaultFormat.value = settings.defaultFormat;
+function setColSource(src) {
+  colSource = src;
+  ui.colSrcTiktok.classList.toggle("active", src === "tiktok");
+  ui.colSrcAmazon.classList.toggle("active", src === "amazon");
   renderColumnList();
+}
+
+function applySettingsToControls() {
+  ui.setCaptureReplies.checked = !!settings.tiktok.captureReplies;
+  ui.setScrollSpeed.value = settings.tiktok.scrollSpeed;
+  ui.setIdleTimeout.value = String(settings.tiktok.idleTimeoutSec);
+  ui.setAutoPaginate.checked = !!settings.amazon.autoPaginate;
+  ui.setMaxPages.value = String(settings.amazon.maxPages);
+  ui.setDefaultFormat.value = settings.defaultFormat;
+  setColSource(state.source === "amazon" ? "amazon" : "tiktok");
   markDefaultFormat();
 }
 
-// Visually mark the default export button.
 function markDefaultFormat() {
   const csvDefault = settings.defaultFormat === "csv";
   ui.csvBtn.classList.toggle("default-format", csvDefault);
@@ -301,7 +379,6 @@ function markDefaultFormat() {
 function openSettings() {
   ui.settingsOverlay.classList.remove("hidden");
 }
-
 function closeSettings() {
   ui.settingsOverlay.classList.add("hidden");
 }
@@ -317,16 +394,27 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+ui.colSrcTiktok.addEventListener("click", () => setColSource("tiktok"));
+ui.colSrcAmazon.addEventListener("click", () => setColSource("amazon"));
+
 ui.setCaptureReplies.addEventListener("change", () => {
-  settings.captureReplies = ui.setCaptureReplies.checked;
+  settings.tiktok.captureReplies = ui.setCaptureReplies.checked;
   saveSettings();
 });
 ui.setScrollSpeed.addEventListener("change", () => {
-  settings.scrollSpeed = ui.setScrollSpeed.value;
+  settings.tiktok.scrollSpeed = ui.setScrollSpeed.value;
   saveSettings();
 });
 ui.setIdleTimeout.addEventListener("change", () => {
-  settings.idleTimeoutSec = Number(ui.setIdleTimeout.value);
+  settings.tiktok.idleTimeoutSec = Number(ui.setIdleTimeout.value);
+  saveSettings();
+});
+ui.setAutoPaginate.addEventListener("change", () => {
+  settings.amazon.autoPaginate = ui.setAutoPaginate.checked;
+  saveSettings();
+});
+ui.setMaxPages.addEventListener("change", () => {
+  settings.amazon.maxPages = Number(ui.setMaxPages.value);
   saveSettings();
 });
 ui.setDefaultFormat.addEventListener("change", () => {
@@ -336,8 +424,9 @@ ui.setDefaultFormat.addEventListener("change", () => {
 });
 
 function setAllColumns(value) {
-  for (const col of ALL_COLUMNS) settings.columns[col] = value;
-  for (const req of REQUIRED_COLUMNS) settings.columns[req] = true;
+  const bag = settings.columns[colSource];
+  for (const col of TTE.columnsFor(colSource)) bag[col] = value;
+  enforceRequired();
   renderColumnList();
   saveSettings();
 }
@@ -354,8 +443,8 @@ ui.resetSettings.addEventListener("click", () => {
 // --- init ------------------------------------------------------------------
 async function init() {
   await loadSettings();
-  applySettingsToControls();
   await loadState();
+  applySettingsToControls();
 }
 
 init();

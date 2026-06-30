@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TikTok Comment Extractor</title>
+    <title>TikTok &amp; Amazon Extractor</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <header class="header">
       <div class="brand">
         <span class="logo">TT</span>
-        <h1>Comment Extractor</h1>
+        <h1>Extractor</h1>
         <button id="settingsBtn" class="icon-btn" title="Settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
             <path
@@ -28,22 +28,22 @@
     </section>
 
     <section id="emptyState" class="empty-state hidden">
-      Open a TikTok video to begin.
+      Open a TikTok video or Amazon product to begin.
     </section>
 
     <section id="main" class="main hidden">
       <div class="stats">
         <div class="stat">
-          <span id="statTotal" class="stat-num">0</span>
-          <span class="stat-label">Total</span>
+          <span id="statN1" class="stat-num">0</span>
+          <span id="statL1" class="stat-label">Total</span>
         </div>
         <div class="stat">
-          <span id="statTop" class="stat-num">0</span>
-          <span class="stat-label">Top-level</span>
+          <span id="statN2" class="stat-num">0</span>
+          <span id="statL2" class="stat-label">Top-level</span>
         </div>
         <div class="stat">
-          <span id="statReplies" class="stat-num">0</span>
-          <span class="stat-label">Replies</span>
+          <span id="statN3" class="stat-num">0</span>
+          <span id="statL3" class="stat-label">Replies</span>
         </div>
       </div>
 
@@ -51,6 +51,7 @@
         <span id="captureDot" class="dot hidden"></span>
         <span id="captureLabel">Start Capture</span>
       </button>
+      <p id="captureHint" class="capture-hint hidden"></p>
 
       <div class="export-row">
         <button id="csvBtn" class="btn btn-secondary" disabled>Export CSV</button>
@@ -58,7 +59,7 @@
       </div>
 
       <a id="clearLink" class="clear-link" role="button" tabindex="0"
-        >Clear data for this video</a
+        >Clear data for this item</a
       >
     </section>
 
@@ -85,9 +86,17 @@
         <div class="settings-body">
           <div class="settings-group">
             <div class="group-title">Columns to extract</div>
+            <div class="segmented">
+              <button id="colSrcTiktok" class="seg-btn active" data-src="tiktok">
+                TikTok
+              </button>
+              <button id="colSrcAmazon" class="seg-btn" data-src="amazon">
+                Amazon
+              </button>
+            </div>
             <p class="group-hint">
-              Choose which fields appear in CSV/XLSX exports. comment_id is always
-              included.
+              Choose which fields appear in exports. The primary id column is
+              always included.
             </p>
             <div id="columnList" class="checklist"></div>
             <div class="mini-row">
@@ -97,7 +106,7 @@
           </div>
 
           <div class="settings-group">
-            <div class="group-title">Capture</div>
+            <div class="group-title">Capture · TikTok</div>
             <label class="row-toggle">
               <span>Expand &amp; capture replies</span>
               <input type="checkbox" id="setCaptureReplies" />
@@ -117,6 +126,24 @@
                 <option value="6">6 seconds</option>
                 <option value="10">10 seconds</option>
                 <option value="20">20 seconds</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="settings-group">
+            <div class="group-title">Capture · Amazon</div>
+            <label class="row-toggle">
+              <span>Auto-paginate through all review pages</span>
+              <input type="checkbox" id="setAutoPaginate" />
+            </label>
+            <label class="row-select">
+              <span>Max pages</span>
+              <select id="setMaxPages">
+                <option value="0">All pages</option>
+                <option value="5">5 pages</option>
+                <option value="10">10 pages</option>
+                <option value="25">25 pages</option>
+                <option value="50">50 pages</option>
               </select>
             </label>
           </div>
